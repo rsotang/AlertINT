@@ -1,0 +1,7 @@
+Para que funcione el XCopy Pachi (3) hay que mapear el directorio pacs del ordenador de Pachi.
+
+Conectar a unidad de red
+
+P: debe apuntar a 
+
+\\10.40.87.167\c$\pacs
