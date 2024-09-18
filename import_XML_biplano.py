@@ -2,7 +2,13 @@
 import os
 import xml.etree.ElementTree as ET
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment
+import warnings
+
+#esta linea esta para que no se vea el mensaje de error de la libreria pandas al limpiar los datos duplicados del biplano
 pd.options.mode.chained_assignment = None  # default='warn'
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
 #Esta función intenta leer un archivo XML y devolver un DataFrame con los datos extraídos
@@ -21,9 +27,6 @@ pd.options.mode.chained_assignment = None  # default='warn'
 
 ###################################################
 
-#Crear otro DataFrame con los pacientes filtrados por criterio de vigilancia y ese DataFrame es el que volcamos en la hoja de excel. Hay que añadir columnas a posteriori????
-#Necesita seguimiento,validado,radiofisico,fecha de validación,notificado
-#METER PACIENTES DE DATAFRAME EN EXCEL
 #METER CODIGOS DE ERROR Y TRY-CATCH 
 ###################################################
 
@@ -131,17 +134,18 @@ def main():
             all_data['Total_Fluoro_Time'] = clean_and_convert_to_float(all_data['Total_Fluoro_Time'])
         else:
             all_data['Total_Fluoro_Time'] = 0
-
+          #unidades el PDA a Gy/cm2 
         all_data['Dose_Area_Product_Total'] = clean_and_convert_to_float(all_data['Dose_Area_Product_Total']) * 10000
         
         all_data['Dose_RP_Total'] = clean_and_convert_to_float(all_data['Dose_RP_Total'])
 
         # Crear el campo "Tiempo de intervención"
-        all_data['Tiempo de intervención'] = (all_data['Total_Acquisition_Time'] + all_data['Total_Fluoro_Time'])/60
-
+        #all_data['Tiempo de intervención'] = (all_data['Total_Acquisition_Time'] + all_data['Total_Fluoro_Time'])/60
+        all_data['Tiempo de intervención'] = all_data['Total_Fluoro_Time']/60
+        
         # Añadir campos adicionales y predefinir valores
         all_data['equipo'] = 'BIPLANO'
-        all_data['servicio'] = 'BIPLANO'
+        all_data['servicio'] = 'Neurointervencionismo'
         all_data['nombre paciente'] = ''
         all_data['Seguimiento'] = ''
 
@@ -162,6 +166,7 @@ def main():
 ###################################################################
         # Eliminar filas con valores 0 en Dose_RP_Total o Dose_Area_Product_Total, es decir los pacientes que se han tratado solo con un panel.
         all_data = all_data[(all_data['Dose_Area_Product_Total'] > 0) & (all_data['Dose_RP_Total'] > 0)]
+        
         #print('punto2')
         
         #print(all_data)
@@ -191,12 +196,69 @@ def main():
         #print("\nDataFrame después de eliminar y sumar filas:")
         #print(result_df)
 
-    # Añadir la condición para el campo 'Seguimiento'
-        result_df['Seguimiento'] = result_df['Dose_RP_Total'].apply(lambda x: 'SI' if x > 5 else 'NO')
-        #print(result_df)
-    else:
-        print("No se encontraron datos en los archivos XML.")
+        #Condiciones de seguimiento
+        ######################################
+        #################################
+        umbral_PDA = 500 #Gycm2
+        umbral_DPR = 5 #Gy
+        umbral_Tiempo = 60 #min
 
+        ################################
+        #######################################
+        result_df['Seguimiento'] = result_df.apply(lambda row: 'SI' if row['Dose_Area_Product_Total'] > umbral_PDA or row['Dose_RP_Total'] > umbral_DPR or row['Tiempo de intervención'] > umbral_Tiempo else 'NO', axis=1) 
+        print(result_df)
+
+ #Generamos array secundario para seleccionar los pacientes con seguimieno
+        df = result_df[result_df['Seguimiento'] == 'SI']
+        #print(df)
+# Guardar todos los datos procesados
+    #all_data.to_csv('Pacienteshibrido.csv', index=False)
+    #all_data.to_excel('Pacienteshibrido.xlsx', index=False)
+
+    ###############################################################
+        print('Limpiando formatos para el excel')
+        print(df)
+        if df.empty:
+            print('No se encontraron pacientes que necesiten seguimiento')
+            exit()
+    
+        df['SeriesDate'] = pd.to_datetime(df['SeriesDate'], format='%Y%m%d').dt.date
+        df['SeriesTime'] = pd.to_datetime(df['SeriesTime'], format='%H%M%S.%f').dt.time
+    
+        print('moviendo al excel')
+        archivo_excel = 'Pruebas de Victor/pacientesprueba.xlsm'
+    
+        # Cargar el libro de trabajo existente
+        libro = load_workbook(archivo_excel, keep_vba=True)
+    
+        # Seleccionar la hoja de trabajo en la que quieres añadir los datos
+        hoja = libro['Pendientes']
+    
+        # Encontrar la última fila con contenido en la hoja
+        ultima_fila = 1
+        for fila in hoja.iter_rows(min_row=1, max_col=1, values_only=True):
+           if all(cell is None for cell in fila):
+               break
+           ultima_fila += 1
+    
+        # Añadir las filas del DataFrame a partir de la última fila con contenido
+        for i, fila in df.iterrows():
+           for j, valor in enumerate(fila):
+               celda = hoja.cell(row=ultima_fila + i , column=j + 1, value=valor)
+                # Centrar el contenido de la celda
+               celda.alignment = Alignment(horizontal='center', vertical='center')
+               # Aplicar el formato adecuado si es fecha u hora
+               if j == 4:  # Suponiendo que la cuara columna es la fecha
+                   celda.number_format = 'DD/MM/YYYY'  # Formato de fecha
+               elif j == 5:  # Suponiendo que la quinta columna es la hora
+                   celda.number_format = 'HH:MM'  # Formato de hora
+    
+    
+        # Guardar los cambios en el archivo de Excel
+        libro.save(archivo_excel)
+    
+        print("Datos añadidos exitosamente.")
+    
 
 
 if __name__ == "__main__":

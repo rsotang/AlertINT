@@ -11,7 +11,7 @@
 
 #El script no es nada especial, simplemente es un bucle de busqueda de datos teniendo en cuenta las peculiaridades del formalismo SR. 
 
-#Los SR son esencialmente XML complicados, no solo están en estructura anidada, si no que cada nido tiene una estructura de cabecera  etiquetas con información, asi que es como un nido de arrays de arrays. (se entiende mejor en la pagina de la NEMA)
+#Los SR son esencialmente XML complicados, no solo están en estructura anidada, si no que cada nido tiene una estructura de cabecera y etiquetas con información, asi que es como un nido de arrays de arrays. (se entiende mejor en la pagina de la NEMA)
 
 #En nuestro caso estamos tabajando con un estandar SR en el que los datos están organizados siguiento la estructura definida por la NEMA como TID 10001 Projection X-Ray Radiation Dose TID 10002 y TID10003
 
@@ -116,30 +116,47 @@ df['Seguimiento'] = df['Dosis Total (Gy)'].apply(lambda x: 'SI' if x > 5 else 'N
 print(df)
 # Opcional: guardar en un archivo CSV
 #df.to_csv('resultados_pacientes_Phillips.csv', index=False)
+
 #####################################################################
+
+print('limpiando datos')
+
+def clean_value(value):
+    if isinstance(value, str):
+        # Eliminar o reemplazar caracteres especiales que puedan causar problemas
+        value = value.replace('^', '').encode('utf-8', 'ignore').decode('utf-8')
+    return value
+
+
+df = df.map(clean_value)
+# Ruta del archivo de Excel
+
+
 print('moviendo al excel')
-nombre_archivo = 'Pruebas de Victor/pacientesprueba.xlsm'
-nombre_hoja = 'Pendientes'
+archivo_excel = 'Pruebas de Victor/pacientesprueba.xlsm'
 
-libro = load_workbook(nombre_archivo, keep_vba=True)
+# Cargar el libro de trabajo existente
+libro = load_workbook(archivo_excel, keep_vba=True)
 
-# Seleccionar la hoja de trabajo
-if nombre_hoja in libro.sheetnames:
-    hoja = libro[nombre_hoja]
-else:
-    hoja = libro.create_sheet(nombre_hoja)
+# Seleccionar la hoja de trabajo en la que quieres añadir los datos
+hoja = libro['Pendientes']
 
-    # Determinar la última fila con contenido
-ultima_fila = hoja.max_row
+# Encontrar la última fila con contenido en la hoja
+ultima_fila = 1
+for fila in hoja.iter_rows(min_row=1, max_col=1, values_only=True):
+    if all(cell is None for cell in fila):
+        break
+    ultima_fila += 1
 
-# Guardar el DataFrame en el archivo de Excel a partir de la última fila
-with pd.ExcelWriter(nombre_archivo, engine='openpyxl', mode='a') as writer:
-    #writer.book = libro
-    #writer.sheets = {ws.title: ws for ws in libro.worksheets}
+# Añadir las filas del DataFrame a partir de la última fila con contenido
+for i, fila in df.iterrows():
+    for j, valor in enumerate(fila):
+        hoja.cell(row=ultima_fila + i , column=j + 1, value=valor)
 
-    # Escribir DataFrame en el archivo de Excel
-    df.to_excel(writer, sheet_name=nombre_hoja, startrow=ultima_fila, index=False, header=False)
-    
+# Guardar los cambios en el archivo de Excel
+libro.save(archivo_excel)
+
+print("Datos añadidos exitosamente.")
 ########################################################
 
 
