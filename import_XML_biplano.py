@@ -1,10 +1,13 @@
-
 import os
+from datetime import datetime, timedelta
+import sys
 import xml.etree.ElementTree as ET
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment
 import warnings
+import logging
+import traceback
 
 #esta linea esta para que no se vea el mensaje de error de la libreria pandas al limpiar los datos duplicados del biplano
 pd.options.mode.chained_assignment = None  # default='warn'
@@ -25,9 +28,6 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 #<ObserverContext>, <CT_Accumulated_Dose_Data> (este nodo está dos veces porque genera uno por panel, por eso de que es un arco biplano y tal), y <CT_Acquisition> (este nodo está tantas veces como veces hayan pisado el pedal de fluoro o cine)
 #De momento no parece que haya que modificar el script para adaptarlo al hibrido o a cualquier maquina de Siemenes
 
-###################################################
-
-#METER CODIGOS DE ERROR Y TRY-CATCH 
 ###################################################
 
 def parse_xml_to_df(xml_file):
@@ -73,193 +73,231 @@ def parse_xml_to_df(xml_file):
         print("No se encontró <Query_Criteria> en", xml_file)
 
     # Convertir la lista de diccionarios a un DataFrame
-    if data_list:
-        df = pd.DataFrame(data_list)
-    else:
-        df = pd.DataFrame()  # DataFrame vacío en caso de no encontrar datos
+    return pd.DataFrame(data_list) if data_list else pd.DataFrame()
 
-    return df
+################################################################################################################################################
+# Leer y combinar todos los archivos XML generados por careanalytics en un solo DataFrame
 
-def ImportXML(input_dir):
-# Leer y combinar todos los archivos XML en un solo DataFrame
+def import_xml(input_dir):
+
+# Obtener la fecha de ayer
+    yesterday = datetime.now().date() - timedelta(days=1)
     all_data = pd.DataFrame()
 
     for file in os.listdir(input_dir):
         if file.endswith('.xml'):
             file_path = os.path.join(input_dir, file)
-            print("Procesando archivo:", file_path)
-            df = parse_xml_to_df(file_path)
-            all_data = pd.concat([all_data, df], ignore_index=True)
-    
+             # Obtener la fecha de modificación del archivo
+            file_mod_time = datetime.fromtimestamp(os.path.getmtime(file_path)).date()
+             # Procesar solo los archivos modificados el día anterior
+            if file_mod_time == yesterday:
+                print("Procesando archivo:", file_path)
+                df = parse_xml_to_df(file_path)
+                all_data = pd.concat([all_data, df], ignore_index=True)
+          
+                 
+    if all_data.empty:
+        print('No se han encontrado archivos generados ayer, ', yesterday)
+         
+                
     return all_data
-
+################################################################################################################################################
 #Esta función esta para eliminar las unidades de los xmls y poder quedarnos solo con los numeros
 
 def clean_and_convert_to_float(column):
         # Extrae solo la parte numérica antes de cualquier carácter no numérico y convierte a float
     return pd.to_numeric(column.str.extract(r'^(\d*\.?\d*)')[0], errors='coerce')
+################################################################################################################################################
 
+
+def remove_zero_rows(df):
+    return df[(df['Dose_Area_Product_Total'] > 0) & (df['Dose_RP_Total'] > 0)].reset_index(drop=True)
+
+################################################################################################################################################
+def transform_data(df): #pilla las colummnas que nos interesan y las limpia
+    df['Total_Acquisition_Time'] = clean_and_convert_to_float(df['Total_Acquisition_Time']) if 'Total_Acquisition_Time' in df.columns else 0
+    df['Total_Fluoro_Time'] = clean_and_convert_to_float(df['Total_Fluoro_Time']) if 'Total_Fluoro_Time' in df.columns else 0
+    df['Dose_Area_Product_Total'] = clean_and_convert_to_float(df['Dose_Area_Product_Total']) * 10000
+    df['Dose_RP_Total'] = clean_and_convert_to_float(df['Dose_RP_Total'])
+    df['Tiempo de intervención'] = df['Total_Fluoro_Time'] / 60 
+    #cambio de unidades a minutos y Gy/cm2  y limpieza de caracteres
+    
+    #asignacion de los valores que nos interesan en ciertas columnas para poder hacer avisos en informes en el Excel
+    df['equipo'] = 'BIPLANO'
+    df['servicio'] = 'Neurointervencionismo'
+    df['nombre paciente'] = ''
+    df['Seguimiento'] = ''
+
+    columns_order = [
+        'equipo', 'servicio', 'PatientID', 'nombre paciente', 'SeriesDate', 
+        'SeriesTime', 'StudyDescription', 'Dose_Area_Product_Total', 
+        'Dose_RP_Total', 'Tiempo de intervención', 'Seguimiento'
+    ]
+    return df.reindex(columns=columns_order) #limpianodo los indices vacios de la matriz que quedan por reordenar sus elementos (movidas de Python). Si no se hace, quedan filas en blanco haciendo huecos entre los datos pegados
+################################################################################################################################################
+#FUNCION DE RESERVA POR SI DEJA DE FUNCIONAR ILOC EN UNA VERSION NUEVA DE PANDAS
 
 def aggregate_patient_data(df):
-    # Agrupar por 'PatientID' y sumar las columnas numéricas
+    # Agrupar por 'PatientID' y sumar las columnas numéricas para juntar los pacientes que aparecen por duplicado (uno por panel)
     aggregated_df = df.groupby('PatientID', as_index=False).agg({
         'SeriesDate': 'first',  # Puede usar 'first' o 'min' si la fecha es la misma para todas las entradas
         'SeriesTime': 'first',  # Similar a la fecha, depende de su uso
         'StudyDescription': 'first',
-        'Tiempo de intervención': 'sum',
+        'Tiempo de intervención': 'first', #SOLO COGEMOS EL TUBO A
         'Dose_Area_Product_Total': 'sum',
         'Dose_RP_Total': 'sum'
     })
     return aggregated_df
+################################################################################################################################################
+
+def sum_patient_data(df): #sumamos los pacientes duplicados aprovechandonos de que siempre aparecen apareados en la lista de pacientes del xml
+    result_df = pd.DataFrame(columns=df.columns)
+     # Iterar por las filas
+    for i in range(len(df)):
+        if i == 0 or df.loc[i, 'PatientID'] != df.loc[i-1, 'PatientID']:
+             # Si es la primera fila o el valor de 'PatientID es diferente al anterior, agregar la fila al resultado
+            result_df = pd.concat([result_df, df.loc[[i]]], ignore_index=True)
+        else:
+              # Si el valor es igual al anterior, sumar los valores a la última fila del resultado
+            result_df.loc[result_df.index[-1], 'Dose_Area_Product_Total'] += df.loc[i, 'Dose_Area_Product_Total']
+            result_df.loc[result_df.index[-1], 'Dose_RP_Total'] += df.loc[i, 'Dose_RP_Total']
+            #result_df.loc[result_df.index[-1], 'Tiempo de intervención'] += df.loc[i, 'Tiempo de intervención'] SOLO COGEMOS EL TUBO A
+
+             #MUCHO CUIDADO CON EL .ILOC PERTENECE A UNA VERSIÓN ANTIGUA DE PANDAS, SI SE ACTUALIZA PANDAS ES POSIBLE QUE DEJE DE FUNCIONAR
+    return result_df
+################################################################################################################################################
+
+def apply_follow_up_conditions(df, umbral_PDA, umbral_DPR, umbral_Tiempo):
+    #Triple condicional para asignar valores a la columna de seguimiento. Los umbrales se definen en el main del codigo
+    df['Seguimiento'] = df.apply(
+        lambda row: 'SI' if row['Dose_Area_Product_Total'] > umbral_PDA or row['Dose_RP_Total'] > umbral_DPR or row['Tiempo de intervención'] > umbral_Tiempo else 'NO', 
+        axis=1
+    )
+    return df.reset_index(drop=True)
+
+################################################################################################################################################
+
+def export_to_excel(df, excel_file):
+    #limpiamos los datos para hacerlos portables más facilmente al excel
+    #cambiamos los datos de fecha y hora para que pasen de ser datos tipo "numero" a datos tipo "fecha" y "hora"
+    print('Limpiando y añadiendo datos a hoja Excel: '+excel_file)
+    
+    df['SeriesDate'] = pd.to_datetime(df['SeriesDate'], format='%Y%m%d').dt.date
+    df['SeriesTime'] = pd.to_datetime(df['SeriesTime'], format='%H%M%S.%f').dt.time
+    df['Dose_RP_Total']= df['Dose_RP_Total'].round(2)
+    df['Dose_Area_Product_Total']=df['Dose_Area_Product_Total'].round(2)
+    df['Tiempo de intervención']=df['Tiempo de intervención'].round(2)
+     
+    # Cargar el libro de trabajo existente
+    libro = load_workbook(excel_file, keep_vba=True)
+    
+    # Seleccionar la hoja de trabajo en la que quieres añadir los datos
+    hoja_pendientes = libro['Pendientes']
+    
+    #pegamos los datos a partir de la ultima fila de pacientes rellenada en el excel
+   
+    ultima_fila_pendientes = 1
+    for fila in hoja_pendientes.iter_rows(min_row=1, max_col=1, values_only=True):
+            if fila[0] is None:
+                break
+            ultima_fila_pendientes += 1
+        
+        # Añadir las filas del DataFrame a partir de la última fila con contenido en la hoja "Pendientes"
+    for i, fila in df.iterrows():
+            for j, valor in enumerate(fila):
+                celda = hoja_pendientes.cell(row=ultima_fila_pendientes + i, column=j + 1, value=valor)
+                # Centrar el contenido de la celda
+                celda.alignment = Alignment(horizontal='center', vertical='center')
+                # Aplicar el formato adecuado si es fecha u hora
+                if j == 4:  # Suponiendo que la cuarta columna es la fecha
+                    celda.number_format = 'DD/MM/YYYY'  # Formato de fecha
+                elif j == 5:  # Suponiendo que la quinta columna es la hora
+                    celda.number_format = 'HH:MM'  # Formato de hora
+      
+        
+        # Guardar los cambios en el archivo de Excel
+    libro.save(excel_file)
+    print("Datos añadidos exitosamente.")
+    
+###################################################################################################################
+###################################################################################################################
 
 
-#############################################
+
+###################################################################################################################
+###################################################################################################################
 
 def main():
-    input_dir = 'Pruebas de Victor/Paciente prueba Alertint/XML Biplano'
-    all_data = ImportXML(input_dir)
-
-
-    #limpiamos y reordenamos los datos teniendo en cuenta las particularidades del xml del biplano
-    # pacientes por duplicado (uno por cada panel), unidades fusionadas con los numeros de los campos y reordenar los campos para que encajen con la hoja excel
+    #fragmento inicial para control de errores
+    # Obtener la fecha actual y formatearla para incluirla en el nombre del archivo
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    log_filename = f'Z:\Dosis pacientes\Alertas_Intervencionismo\_PRUEBAS EN CURSO-AlertInt python\_Logs errores\Biplano\error_log_{current_date}.txt'
     
-    if not all_data.empty:
-        # Limpia y convierte las columnas a float, si existen
-        if 'Total_Acquisition_Time' in all_data.columns:
-            all_data['Total_Acquisition_Time'] = clean_and_convert_to_float(all_data['Total_Acquisition_Time'])
-        else:
-            all_data['Total_Acquisition_Time'] = 0
+    # Crear un logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.ERROR)
+    
+    # Crear un manejador de archivo que escriba en el archivo log
+    file_handler = logging.FileHandler(log_filename)
+    file_handler.setLevel(logging.ERROR)
+    
+    # Definir el formato del log
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    
+    # Añadir el manejador al logger
+    logger.addHandler(file_handler)
 
-        if 'Total_Fluoro_Time' in all_data.columns:
-            all_data['Total_Fluoro_Time'] = clean_and_convert_to_float(all_data['Total_Fluoro_Time'])
-        else:
-            all_data['Total_Fluoro_Time'] = 0
-          #unidades el PDA a Gy/cm2 
-        all_data['Dose_Area_Product_Total'] = clean_and_convert_to_float(all_data['Dose_Area_Product_Total']) * 10000
+############################################################################
+    try:  #ESTE ES EL CODIGO DE VERDAD  
+    
         
-        all_data['Dose_RP_Total'] = clean_and_convert_to_float(all_data['Dose_RP_Total'])
-
-        # Crear el campo "Tiempo de intervención"
-        #all_data['Tiempo de intervención'] = (all_data['Total_Acquisition_Time'] + all_data['Total_Fluoro_Time'])/60
-        all_data['Tiempo de intervención'] = all_data['Total_Fluoro_Time']/60
+        #ubicacion de ficheros XML
+        input_dir = 'Z:\Dosis pacientes\Alertas_Intervencionismo\Historial pacientes\Biplano'
+        print('Buscando pacientes de Biplano en ' + input_dir)
+        #hoja de pacietes Alertin
+        excel_file = 'Z:\Dosis pacientes\Alertas_Intervencionismo\_PRUEBAS EN CURSO-AlertInt python\ppacientes.xlsm'
         
-        # Añadir campos adicionales y predefinir valores
-        all_data['equipo'] = 'BIPLANO'
-        all_data['servicio'] = 'Neurointervencionismo'
-        all_data['nombre paciente'] = ''
-        all_data['Seguimiento'] = ''
-
-        # Reordenar columnas según el orden especificado
-        columns_order = [
-            'equipo', 'servicio', 'PatientID', 'nombre paciente', 'SeriesDate', 
-            'SeriesTime', 'StudyDescription', 'Dose_Area_Product_Total', 
-            'Dose_RP_Total', 'Tiempo de intervención', 'Seguimiento'
-        ]
-        all_data = all_data.reindex(columns=columns_order)
-        #print('punto1')
-        #print(all_data)
-  #################################################################
-
-
-
-
-###################################################################
-        # Eliminar filas con valores 0 en Dose_RP_Total o Dose_Area_Product_Total, es decir los pacientes que se han tratado solo con un panel.
-        all_data = all_data[(all_data['Dose_Area_Product_Total'] > 0) & (all_data['Dose_RP_Total'] > 0)]
+        #umbrales de notificacion
+        umbral_DPR = 5
+        umbral_PDA = 500
+        umbral_Tiempo = 60
         
-        #print('punto2')
         
-        #print(all_data)
-        #Todo el codigo siguiente es el pifostio necesario para limpiar y sumar los valores de los dos paneles en un paciente
+        all_data = import_xml(input_dir)
+    
+        if not all_data.empty:
+            
+            cleaned_data = transform_data(all_data)
+            
+            filtered_data = remove_zero_rows(cleaned_data)
+            
+            summed_data = sum_patient_data(filtered_data)
+            
+            final_data = apply_follow_up_conditions(summed_data,umbral_PDA,umbral_DPR,umbral_Tiempo)
+    
+            #selección y flitrado de pacienes, solo pega en la hoja de pacientes los que tienes SI en la celda de seguimiento
+            df_follow_up = final_data[final_data['Seguimiento'] == 'SI']
+            df_follow_up = df_follow_up.reset_index(drop=True)
+            print(df_follow_up)
+            
+            if df_follow_up.empty:
+                print('No se encontraron pacientes que necesiten seguimiento')
+                sys.exit()
+    
+            export_to_excel(df_follow_up, excel_file)
+            
+##############################################################################
         
-        #como hemos borrado un monton de columnas con valores cero, el array tiene indices discontinuos, asi que los reiniciamos
-        
-        all_data = all_data.reset_index(drop=True)
-        
-        #Inicializar un DataFrame vacío para acumular resultados
-        result_df = pd.DataFrame(columns=all_data.columns)
-
-        # Iterar por las filas
-        for i in range(len(all_data)):
-            if i == 0 or all_data.loc[i,'PatientID'] != all_data.loc[i-1, 'PatientID']:
-                # Si es la primera fila o el valor de 'PatientID es diferente al anterior, agregar la fila al resultado
-                
-                result_df = pd.concat([result_df, all_data.loc[[i]]], ignore_index=True)
-                
-            else:
-                # Si el valor es igual al anterior, sumar los valores a la última fila del resultado
-                result_df.loc[result_df.index[-1], 'Dose_Area_Product_Total'] += all_data.loc[i, 'Dose_Area_Product_Total']
-                result_df.loc[result_df.index[-1], 'Dose_RP_Total'] += all_data.loc[i, 'Dose_RP_Total']
-                result_df.loc[result_df.index[-1], 'Tiempo de intervención'] += all_data.loc[i, 'Tiempo de intervención']
-
-        # Mostrar el DataFrame resultante
-        #print("\nDataFrame después de eliminar y sumar filas:")
-        #print(result_df)
-
-        #Condiciones de seguimiento
-        ######################################
-        #################################
-        umbral_PDA = 500 #Gycm2
-        umbral_DPR = 5 #Gy
-        umbral_Tiempo = 60 #min
-
-        ################################
-        #######################################
-        result_df['Seguimiento'] = result_df.apply(lambda row: 'SI' if row['Dose_Area_Product_Total'] > umbral_PDA or row['Dose_RP_Total'] > umbral_DPR or row['Tiempo de intervención'] > umbral_Tiempo else 'NO', axis=1) 
-        print(result_df)
-
- #Generamos array secundario para seleccionar los pacientes con seguimieno
-        df = result_df[result_df['Seguimiento'] == 'SI']
-        #print(df)
-# Guardar todos los datos procesados
-    #all_data.to_csv('Pacienteshibrido.csv', index=False)
-    #all_data.to_excel('Pacienteshibrido.xlsx', index=False)
-
-    ###############################################################
-        print('Limpiando formatos para el excel')
-        print(df)
-        if df.empty:
-            print('No se encontraron pacientes que necesiten seguimiento')
-            exit()
+    except Exception as e:
+        # Capturar y registrar el error
+        logger.error("Error occurred: %s", e)
+        logger.error(traceback.format_exc())
     
-        df['SeriesDate'] = pd.to_datetime(df['SeriesDate'], format='%Y%m%d').dt.date
-        df['SeriesTime'] = pd.to_datetime(df['SeriesTime'], format='%H%M%S.%f').dt.time
-    
-        print('moviendo al excel')
-        archivo_excel = 'Pruebas de Victor/pacientesprueba.xlsm'
-    
-        # Cargar el libro de trabajo existente
-        libro = load_workbook(archivo_excel, keep_vba=True)
-    
-        # Seleccionar la hoja de trabajo en la que quieres añadir los datos
-        hoja = libro['Pendientes']
-    
-        # Encontrar la última fila con contenido en la hoja
-        ultima_fila = 1
-        for fila in hoja.iter_rows(min_row=1, max_col=1, values_only=True):
-           if all(cell is None for cell in fila):
-               break
-           ultima_fila += 1
-    
-        # Añadir las filas del DataFrame a partir de la última fila con contenido
-        for i, fila in df.iterrows():
-           for j, valor in enumerate(fila):
-               celda = hoja.cell(row=ultima_fila + i , column=j + 1, value=valor)
-                # Centrar el contenido de la celda
-               celda.alignment = Alignment(horizontal='center', vertical='center')
-               # Aplicar el formato adecuado si es fecha u hora
-               if j == 4:  # Suponiendo que la cuara columna es la fecha
-                   celda.number_format = 'DD/MM/YYYY'  # Formato de fecha
-               elif j == 5:  # Suponiendo que la quinta columna es la hora
-                   celda.number_format = 'HH:MM'  # Formato de hora
-    
-    
-        # Guardar los cambios en el archivo de Excel
-        libro.save(archivo_excel)
-    
-        print("Datos añadidos exitosamente.")
-    
-
+    finally:
+        # Asegurarse de que se cierra el manejador del archivo
+        logger.removeHandler(file_handler)
+        file_handler.close()
 
 if __name__ == "__main__":
     main()
