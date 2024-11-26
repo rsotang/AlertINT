@@ -234,7 +234,7 @@ def main():
     
             export_to_excel(df_follow_up, excel_file)
     
-        print("Datos añadidos exitosamente.")
+        
 ##############################################################################
         
     except Exception as e:

@@ -88,13 +88,15 @@ def procesar_archivos(carpeta_srdicom):
                 hora_intervencion = ds.StudyTime
                 descripcion_estudio = ds.StudyDescription if 'StudyDescription' in ds else 'N/A'
                 equipo = ds.StationName
-                if equipo == '72206-656':
+                if equipo == '722026-656':
+                    equipo = 'Hemodinámicas Philips 2'
+                elif equipo == '722026-657':
                     equipo = 'Hemodinámicas Philips 3'
-                elif equipo == '72206-657':
+                elif equipo == '722026-658':
                     equipo = 'Hemodinámicas Philips 1'
-                elif equipo == '72206-658':
-                    equipo == 'Hemodinámicas Philips 2'
                     
+                print(equipo)    
+                        
                 # Extraer información de dosis, tiempo y PDA
                 dosis_pref, tiempo_total_intervencion, pda_total = extraer_datos_dosis(archivo_dicom)
                 
